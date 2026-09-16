@@ -14,14 +14,15 @@ Supported scripts:
 | Telugu | Telugu |
 | Kannada | Kannada |
 | Tamil | Tamil |
+| English | IAST Roman transliteration (`kṛṣṇa`, `bhārata`) |
 
-Any of the 5 can convert to any of the other 4 — 20 combinations.
+Any supported option can be used in either direction. English means precise
+IAST Roman transliteration, not translation of meaning.
 
 ## Running it
 
-**Just double-click `Run Transliterator.bat`.** The window opens; nothing to
-install beyond Python 3 itself (the app uses only the standard library, no
-`pip install` of anything).
+**Just double-click `Run Transliterator.bat`.** The launcher installs the small
+`indic-transliteration` dependency on first use, then opens the window.
 
 If Windows says Python is missing, get it from
 <https://www.python.org/downloads/> and tick **"Add python.exe to PATH"**
@@ -88,9 +89,12 @@ source script  →  Devanagari  →  target script
 
 Where the target script has no equivalent letter, a fallback chain substitutes
 the nearest available sound (`घ → ग → क`), so Tamil — which has none of the
-three — lands on `க`. Anything outside the Indic blocks (English words,
+three — lands on `க`. Anything outside the Indic blocks (unselected English words,
 punctuation, `2024`) passes through untouched, so mixed-language files are
 safe.
+
+The app does not impose a character limit on input, preview, conversion, or
+saved output. Very large files are limited only by available memory.
 
 Input is read as UTF-8, UTF-16 or Windows-1252, whichever decodes; output is
 always written as UTF-8.

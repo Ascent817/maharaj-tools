@@ -5,10 +5,10 @@
 
 WHAT IT DOES
 ------------
-  1. You give it a text file      (.txt)   - the input
+  1. You give it a text/Excel file (.txt/.xls) - the input
   2. You give it a reference list (.csv)   - column A = the word to find
                                              column B = the word to put instead
-  3. It writes a new text file    (.txt)   - the output
+  3. It writes a matching output  (.txt/.xls) - the output
 
 Your original input file is never changed.
 
@@ -32,17 +32,23 @@ produces dist\FindAndReplace.exe - a single file you can copy anywhere.
 
 HOW TO USE THE WINDOW
 ---------------------
-  1. Input file      - Browse to your .txt file.
+  1. Input file      - Browse to your .txt or legacy Excel .xls file.
   2. Reference file  - Browse to your .csv file.
                        The pairs appear in the Log box straight away, so
                        you can confirm the list was read correctly.
-  3. Output file     - Filled in for you as <name>_replaced.txt.
+  3. Output file     - Filled in as <name>_replaced.txt or
+                       <name>_replaced.xls.
                        Change it if you want it somewhere else.
   4. Click "Run Find & Replace".
 
 The Log box then shows how many times each word was replaced. Any word
 that was never found in the input is marked with "!" at the start of the
 line, so nothing fails silently.
+
+For .xls files, the first worksheet is processed. Text cells are replaced;
+numbers, dates, booleans and blanks keep their value types. The output is a
+values-only .xls workbook with the same first-sheet name. Formatting, formulas,
+charts, macros and additional worksheets are not copied.
 
 
 THE REFERENCE CSV

@@ -35,7 +35,8 @@ else:
 try:
     from remove_timestamps import (
         default_output, finish, heading_from_name, looks_like_youtube,
-        output_for_video, read_text, split_heading, strip_timestamps, with_heading,
+        output_for_playlist, output_for_video, playlist_section, read_text,
+        split_heading, strip_timestamps, with_heading,
     )
     import format_transcript as fmt
 except ImportError:
@@ -182,9 +183,8 @@ class App(ttk.Frame):
                     textvariable=self.playlist_count).grid(row=0, column=1, padx=(6, 6))
         ttk.Label(playlist, text="videos").grid(row=0, column=2, sticky="w")
         ttk.Label(yt_tab,
-                  text="Unticked, a playlist link fetches only the one video it points at. "
-                       "YouTube lists 100 videos per playlist page, which is the most that "
-                       "can be read in one go.",
+                  text="The selected number of videos begins at the linked video or index. "
+                       "Playlist transcripts are combined into one file.",
                   foreground="#777777", wraplength=430, justify="left"
                   ).grid(row=4, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
 
@@ -405,6 +405,7 @@ class App(ttk.Frame):
         plan, rejected = [], []
         for entry in entries:
             playlist_id = yt.extract_playlist_id(entry)
+            playlist_index = yt.extract_playlist_index(entry)
             try:
                 video_id = yt.extract_video_id(entry)
                 reason = None
@@ -415,7 +416,7 @@ class App(ttk.Frame):
                 # Keep both: a shared youtu.be link names only the video, and the
                 # playlist it belongs to has to be looked up from its watch page.
                 plan.append({"playlist": playlist_id, "video": video_id,
-                             "entry": entry})
+                             "index": playlist_index, "entry": entry})
             else:
                 rejected.append((entry, reason or "No video in that link."))
 
@@ -442,12 +443,13 @@ class App(ttk.Frame):
         def work(progress):
             if not self.dependency_ready():
                 raise yt.TranscriptError(
-                    "The youtube-transcript-api package is not installed.\n\n"
-                    "Install it by opening a terminal and running:\n"
-                    "    python -m pip install youtube-transcript-api")
+                    "The transcript dependencies are not installed.\n\n"
+                    "Install them by opening a terminal and running:\n"
+                    "    python -m pip install -r requirements.txt")
 
-            # Turn playlists into video ids first, so the count below is real.
-            jobs, notes, seen = [], [], set()
+            # Resolve entries into output groups. A playlist is one combined
+            # output; ordinary video links remain one output each.
+            groups, notes = [], []
             failures = list(rejected)
             for item in plan:
                 playlist_id, video_id = item["playlist"], item["video"]
@@ -468,45 +470,33 @@ class App(ttk.Frame):
                         info = yt.playlist_for_video(video_id)
 
                 if info:
-                    ids, start = yt.take_from(info, video_id, per_playlist)
+                    ids, start = yt.take_from(
+                        info, video_id, per_playlist, item.get("index"))
                     note = (f'Playlist "{info["title"]}": taking {len(ids)} '
                             f'of {info["found"]} listed')
-                    if start:
-                        note += f", starting at #{start + 1}"
-                    if info["capped"] and per_playlist > len(ids):
-                        note += " - YouTube lists only 100 per page"
+                    note += f", starting at #{start + 1}"
                     notes.append(note)
-                    for found_id in ids:
-                        if found_id not in seen:
-                            seen.add(found_id)
-                            jobs.append(found_id)
+                    groups.append({"playlist": info, "ids": ids, "start": start})
                     continue
 
                 if expand and video_id and not playlist_id:
                     notes.append(f"No playlist found for {video_id} - "
                                  "took that video on its own.")
-                if video_id and video_id not in seen:
-                    seen.add(video_id)
-                    jobs.append(video_id)
+                if video_id:
+                    groups.append({"playlist": None, "ids": [video_id], "start": 0})
 
             done, languages, already, blocked = [], [], [], False
-            total = len(jobs)
-            for index, video_id in enumerate(jobs, start=1):
-                if skip_existing:
-                    # Costs no request, so a re-run after a failed batch asks
-                    # YouTube only for what is genuinely missing.
-                    have = existing_transcript(out_dir, video_id)
-                    if have:
-                        already.append(have.name)
-                        continue
+            total = sum(len(group["ids"]) for group in groups)
+            current = 0
 
-                progress(f"Downloading {index} of {total} ...")
+            def fetch_one(video_id, title_hint=None):
+                nonlocal languages, blocked, current
+                current += 1
+                progress(f"Downloading {current} of {total} ...")
 
-                def waiting(seconds, attempt, index=index, total=total):
-                    # Say why nothing is happening, so a pause is not mistaken
-                    # for a hang.
+                def waiting(seconds, attempt):
                     progress(f"YouTube is throttling - waiting {seconds}s, then "
-                             f"retrying {index} of {total} ...")
+                             f"retrying {current} of {total} ...")
 
                 fell_back = False
                 try:
@@ -515,46 +505,106 @@ class App(ttk.Frame):
                     snippets = yt.fetch_snippets(video_id, code, generated,
                                                  on_wait=waiting)
                 except yt.RateLimited as exc:
-                    # Retries are already exhausted; pressing on would only make
-                    # the block worse, so stop and say where the run got to.
                     blocked = True
-                    done.append({"ok": False, "id": video_id, "error": first_line(exc)})
-                    notes.append(
-                        f"Stopped at {index} of {total}: YouTube is rate-limiting this "
-                        "network. Leave it a while - the block can last minutes or "
-                        "longer - then run the same links again. Videos already saved "
-                        "are simply written again, so nothing is lost.")
-                    break
+                    return {"ok": False, "id": video_id,
+                            "title": title_hint or video_id, "error": first_line(exc)}
                 except yt.TranscriptError as exc:
-                    # One video missing the chosen language must not stop the run.
                     if not code:
-                        done.append({"ok": False, "id": video_id,
-                                     "error": first_line(exc)})
-                        continue
+                        return {"ok": False, "id": video_id,
+                                "title": title_hint or video_id,
+                                "error": first_line(exc)}
                     try:
                         snippets = yt.fetch_snippets(video_id, on_wait=waiting)
                         fell_back = True
+                    except yt.RateLimited as inner:
+                        blocked = True
+                        return {"ok": False, "id": video_id,
+                                "title": title_hint or video_id,
+                                "error": first_line(inner)}
                     except yt.TranscriptError as inner:
-                        done.append({"ok": False, "id": video_id,
-                                     "error": first_line(inner)})
-                        continue
+                        return {"ok": False, "id": video_id,
+                                "title": title_hint or video_id,
+                                "error": first_line(inner)}
 
-                title = yt.fetch_title(video_id) or video_id
+                title = title_hint or yt.fetch_title(video_id) or video_id
                 if as_prose:
                     text = fmt.format_timed(snippets, **format_options)
                 else:
                     text = finish([item["text"] for item in snippets],
                                   drop_empty=True, merge_repeats=merge)
-                if heading_on:
-                    # The same sanitised title the filename uses, so they match.
-                    text = with_heading(text, yt.safe_filename(title,
-                                                               fallback=video_id))
-                path = output_for_video(title, video_id, out_dir)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(text, encoding="utf-8")
-                done.append({"ok": True, "id": video_id, "title": title,
-                             "path": path, "captions": len(snippets),
-                             "fallback": fell_back})
+                return {"ok": True, "id": video_id, "title": title,
+                        "text": text, "captions": len(snippets),
+                        "fallback": fell_back}
+
+            for group in groups:
+                playlist_info = group["playlist"]
+                if playlist_info:
+                    ids, start = group["ids"], group["start"]
+                    if not ids:
+                        continue
+                    complete_path = output_for_playlist(
+                        playlist_info["title"], playlist_info["id"], start + 1,
+                        start + len(ids), out_dir)
+                    if skip_existing and complete_path.exists():
+                        already.append(complete_path.name)
+                        continue
+                    title_by_id = {entry["id"]: entry["title"]
+                                   for entry in playlist_info.get("entries", [])}
+                    sections, missing = [], 0
+                    for offset, video_id in enumerate(ids):
+                        position = start + offset + 1
+                        item = fetch_one(video_id, title_by_id.get(video_id))
+                        if item["ok"]:
+                            sections.append(playlist_section(
+                                position, item["title"], video_id, item["text"]))
+                        else:
+                            missing += 1
+                            sections.append(playlist_section(
+                                position, item["title"], video_id, "",
+                                error=item["error"]))
+                        if blocked:
+                            for rest_offset, rest_id in enumerate(ids[offset + 1:], offset + 1):
+                                rest_position = start + rest_offset + 1
+                                sections.append(playlist_section(
+                                    rest_position, title_by_id.get(rest_id, rest_id),
+                                    rest_id, "", error="not attempted because YouTube rate-limited the batch"))
+                                missing += 1
+                            break
+                    path = (output_for_playlist(
+                        playlist_info["title"], playlist_info["id"], start + 1,
+                        start + len(ids), out_dir, partial=True)
+                            if missing else complete_path)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("\n".join(sections), encoding="utf-8")
+                    done.append({"ok": True, "id": playlist_info["id"],
+                                 "title": playlist_info["title"], "path": path,
+                                 "fallback": False, "partial": bool(missing),
+                                 "missing": missing})
+                else:
+                    video_id = group["ids"][0]
+                    if skip_existing:
+                        have = existing_transcript(out_dir, video_id)
+                        if have:
+                            already.append(have.name)
+                            continue
+                    item = fetch_one(video_id)
+                    if not item["ok"]:
+                        done.append(item)
+                    else:
+                        text = item.pop("text")
+                        if heading_on:
+                            text = with_heading(text, yt.safe_filename(
+                                item["title"], fallback=video_id))
+                        path = output_for_video(item["title"], video_id, out_dir)
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(text, encoding="utf-8")
+                        item["path"] = path
+                        done.append(item)
+                if blocked:
+                    notes.append(
+                        f"Stopped at {current} of {total}: YouTube is rate-limiting this "
+                        "network. Successful playlist sections were saved in a partial file.")
+                    break
             if already:
                 notes.append(f"Already saved, so not fetched again: {len(already)}")
             return {"done": done, "rejected": failures, "languages": languages,
@@ -566,6 +616,7 @@ class App(ttk.Frame):
     def dependency_ready():
         try:
             import youtube_transcript_api  # noqa: F401
+            import yt_dlp  # noqa: F401
             return True
         except ImportError:
             return False
@@ -583,8 +634,11 @@ class App(ttk.Frame):
         if saved:
             lines.append(f"Saved {len(saved)} transcript(s):")
             for item in saved:
-                note = "   (chosen language unavailable - used best available)" \
-                    if item.get("fallback") else ""
+                if item.get("partial"):
+                    note = f"   (partial - {item.get('missing', 0)} unavailable)"
+                else:
+                    note = "   (chosen language unavailable - used best available)" \
+                        if item.get("fallback") else ""
                 lines.append(f"  OK    {item['path'].name}{note}")
         if failed or rejected:
             if lines:

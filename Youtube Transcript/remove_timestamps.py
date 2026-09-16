@@ -124,6 +124,24 @@ def output_for_video(title: str, video_id: str, folder) -> Path:
     return Path(folder) / f"{safe_filename(title, fallback=video_id)} [{video_id}].txt"
 
 
+def output_for_playlist(title: str, playlist_id: str, start: int, end: int,
+                        folder, partial: bool = False) -> Path:
+    """Stable name for one combined playlist selection."""
+    from youtube_transcript import safe_filename
+    suffix = "_partial" if partial else ""
+    name = safe_filename(title, fallback=playlist_id, max_len=90)
+    return Path(folder) / (
+        f"{name} [{playlist_id}] {start:03d}-{end:03d}{suffix}.txt")
+
+
+def playlist_section(position: int, title: str, video_id: str, text: str,
+                     error: str | None = None) -> str:
+    """One numbered, titled section in a combined playlist transcript."""
+    heading = f"#{position} - {title or video_id} [{video_id}]"
+    body = f"[Transcript unavailable: {error}]" if error else text.strip()
+    return f"{heading}\n\n{body}\n"
+
+
 # The " [dQw4w9WgXcQ]" tag that output_for_video() appends to a filename.
 ID_SUFFIX = re.compile(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$")
 
@@ -277,7 +295,7 @@ def main(argv=None) -> int:
                         help="do not put the title on the first line of the output")
     parser.add_argument("--playlist", type=int, metavar="N",
                         help="for a link that belongs to a playlist, transcribe the "
-                             "playlist's first N videos instead of just that one")
+                             "N videos beginning at the linked video/index into one file")
     parser.add_argument("--encoding", default="utf-8", help="output encoding (default: utf-8)")
     args = parser.parse_args(argv)
 
@@ -292,10 +310,7 @@ def main(argv=None) -> int:
     if not sources:
         parser.error("nothing to do: give a YouTube link or a file path")
 
-    sources, failures = expand_playlists(sources, args)
-    if not sources:
-        print("Nothing to do.", file=sys.stderr)
-        return 1
+    failures = 0
 
     if args.output and len(sources) > 1:
         parser.error("-o/--output names a single file; with several sources use --outdir")
@@ -304,7 +319,19 @@ def main(argv=None) -> int:
         if len(sources) > 1:
             print(f"\n[{index}/{len(sources)}] {source}")
         if looks_like_youtube(source) or args.list_languages:
-            failures += run_youtube(source, args)
+            try:
+                import youtube_transcript as yt
+                playlist_id = yt.extract_playlist_id(source)
+                try:
+                    video_id = yt.extract_video_id(source)
+                except yt.TranscriptError:
+                    video_id = None
+            except ImportError:
+                playlist_id = video_id = None
+            if args.playlist is not None or (playlist_id and video_id is None):
+                failures += run_playlist(source, args)
+            else:
+                failures += run_youtube(source, args)
         elif "://" in source:
             # A link, but not a YouTube one - don't mistake it for a file path.
             print(f"Error: not a YouTube link: {source}", file=sys.stderr)
@@ -314,6 +341,75 @@ def main(argv=None) -> int:
 
     if len(sources) > 1:
         print(f"\nDone: {len(sources) - failures} succeeded, {failures} failed.")
+    return 1 if failures else 0
+
+
+def run_playlist(raw: str, args) -> int:
+    """Download one playlist selection into one numbered transcript file."""
+    import format_transcript as fmt
+    import youtube_transcript as yt
+
+    playlist_id = yt.extract_playlist_id(raw)
+    try:
+        video_id = yt.extract_video_id(raw)
+    except yt.TranscriptError:
+        video_id = None
+    if playlist_id:
+        info = yt.fetch_playlist(playlist_id)
+    elif video_id:
+        info = yt.playlist_for_video(video_id)
+        if info is None:
+            return run_youtube(raw, args)
+    else:
+        print(f"Error: no playlist found in {raw}", file=sys.stderr)
+        return 1
+
+    limit = args.playlist if args.playlist is not None else info["found"]
+    ids, start = yt.take_from(info, video_id, limit, yt.extract_playlist_index(raw))
+    if not ids:
+        print("Error: no videos selected from that playlist.", file=sys.stderr)
+        return 1
+
+    title_by_id = {entry["id"]: entry["title"] for entry in info.get("entries", [])}
+    sections, failures = [], 0
+    for offset, selected_id in enumerate(ids):
+        position = start + offset + 1
+        title = title_by_id.get(selected_id) or yt.fetch_title(selected_id) or selected_id
+        try:
+            snippets = yt.fetch_snippets(selected_id, args.language)
+            if args.raw:
+                cleaned = finish([item["text"] for item in snippets],
+                                 drop_empty=True, merge_repeats=args.merge_repeats)
+            else:
+                cleaned = fmt.format_timed(
+                    snippets, remove_brackets=not args.keep_tags,
+                    remove_fillers=not args.keep_fillers)
+            sections.append(playlist_section(position, title, selected_id, cleaned))
+        except yt.TranscriptError as exc:
+            failures += 1
+            sections.append(playlist_section(
+                position, title, selected_id, "", error=str(exc).split("\n")[0]))
+            if isinstance(exc, yt.RateLimited):
+                for rest_offset, rest_id in enumerate(ids[offset + 1:], offset + 1):
+                    rest_position = start + rest_offset + 1
+                    sections.append(playlist_section(
+                        rest_position, title_by_id.get(rest_id, rest_id), rest_id, "",
+                        error="not attempted because YouTube rate-limited the batch"))
+                    failures += 1
+                break
+
+    folder = Path(args.outdir).expanduser() if args.outdir else Path(__file__).resolve().parent
+    folder.mkdir(parents=True, exist_ok=True)
+    if args.output:
+        out_path = Path(args.output).expanduser()
+    else:
+        out_path = output_for_playlist(
+            info["title"], info["id"], start + 1, start + len(ids), folder,
+            partial=bool(failures))
+    out_path.write_text("\n".join(sections), encoding=args.encoding)
+    print(f"Playlist: {info['title']}")
+    print(f"Videos  : {len(ids)} selected, starting at #{start + 1}")
+    print(f"Wrote   : {out_path}")
     return 1 if failures else 0
 
 

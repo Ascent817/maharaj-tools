@@ -12,14 +12,15 @@ character by character.  Supported scripts:
     Telugu      (Telugu)
     Kannada     (Kannada)
     Tamil       (Tamil)
+    English     (IAST Roman transliteration)
 
 This is *transliteration*, not translation: the sounds are carried over,
 the meaning is not.  "namaste" written in Devanagari becomes the same word
 spelled with Kannada letters.
 
-The app needs nothing but a standard Python 3 install - no pip packages.
-Double-click "Run Transliterator.bat" (Windows) or run this file directly
-for the graphical window; pass command-line options for batch use.
+Double-click "Run Transliterator.bat" (Windows) to install the pinned IAST
+dependency when needed and open the graphical window; pass command-line
+options for batch use.
 
     python indic_transliterate.py -i input.txt -o output.txt -t tamil
     python indic_transliterate.py --list
@@ -45,7 +46,7 @@ import sys
 import unicodedata
 
 APP_NAME = "Indic Script Transliterator"
-VERSION = "1.0"
+VERSION = "1.1"
 
 DEV = 0x0900          # start of the Devanagari block, used as the pivot
 BLOCK = 0x80          # every supported script occupies 0x80 code points
@@ -107,9 +108,17 @@ SCRIPTS = {
         },
         "tgt": {},
     },
+    "english": {
+        "name": "English",
+        "languages": "IAST Roman transliteration",
+        "base": None,
+        "src": {},
+        "tgt": {},
+    },
 }
 
-SCRIPT_ORDER = ["devanagari", "bengali", "telugu", "kannada", "tamil"]
+INDIC_SCRIPT_ORDER = ["devanagari", "bengali", "telugu", "kannada", "tamil"]
+SCRIPT_ORDER = INDIC_SCRIPT_ORDER + ["english"]
 
 # Friendly aliases accepted on the command line and in the drop-downs.
 ALIASES = {
@@ -127,6 +136,9 @@ ALIASES = {
     "kn": "kannada",
     "kannad": "kannada",
     "ta": "tamil",
+    "en": "english",
+    "latin": "english",
+    "iast": "english",
 }
 
 # Characters shared by all Indic scripts - never remapped.
@@ -193,7 +205,7 @@ def _build_nukta_maps():
     two-part vowel signs such as Bengali ো are left intact.
     """
     split, join = {}, {}
-    for key in SCRIPTS:
+    for key in INDIC_SCRIPT_ORDER:
         base = SCRIPTS[key]["base"]
         for cp in range(base, base + BLOCK):
             if not _assigned(cp):
@@ -342,12 +354,13 @@ def resolve_script(name):
 
 def detect_script(text):
     """Guess which supported script `text` is written in, or None."""
-    counts = {key: 0 for key in SCRIPTS}
+    counts = {key: 0 for key in INDIC_SCRIPT_ORDER}
     for ch in text:
         cp = ord(ch)
         if cp < 0x0900 or cp > 0x0D7F:
             continue
-        for key, spec in SCRIPTS.items():
+        for key in INDIC_SCRIPT_ORDER:
+            spec = SCRIPTS[key]
             if spec["base"] <= cp < spec["base"] + BLOCK:
                 if 0x0964 <= cp <= 0x0965:       # shared danda proves nothing
                     break
@@ -364,14 +377,41 @@ def transliterate(text, source, target, digits=True):
     if not text:
         return ""
     text = unicodedata.normalize("NFC", text)
-    text = _split_nukta(text)
-    dev = text.translate(_script_to_dev_table(source, digits))
+    if source == target:
+        return text
+
+    if source == "english":
+        dev = _roman_transliterate(text, "iast", "devanagari")
+    else:
+        text = _split_nukta(text)
+        dev = text.translate(_script_to_dev_table(source, digits))
+
+    if target == "english":
+        out = _roman_transliterate(dev, "devanagari", "iast")
+        if digits:
+            out = out.translate({0x0966 + i: str(i) for i in range(10)})
+        return unicodedata.normalize("NFC", out)
+
     touch_up = PIVOT_TOUCHUPS.get(target)
     if touch_up is not None:
         dev = touch_up(dev)
     out = dev.translate(_dev_to_script_table(target, digits))
     out = _join_nukta(out, target)
     return unicodedata.normalize("NFC", out)
+
+
+def _roman_transliterate(text, source_scheme, target_scheme):
+    """Convert between IAST and Devanagari using indic-transliteration."""
+    try:
+        from indic_transliteration import sanscript
+        from indic_transliteration.sanscript import transliterate as convert
+    except ImportError as exc:
+        raise RuntimeError(
+            "English (IAST) support needs the indic-transliteration package. "
+            "Install it with: python -m pip install indic-transliteration==2.3.82"
+        ) from exc
+    schemes = {"iast": sanscript.IAST, "devanagari": sanscript.DEVANAGARI}
+    return convert(text, schemes[source_scheme], schemes[target_scheme])
 
 
 # --------------------------------------------------------------------------
@@ -485,6 +525,14 @@ def selftest():
     # Identity conversion.
     check("identity", transliterate(text, "devanagari", "devanagari"), text)
 
+    # English means precise IAST Roman transliteration, not translation.
+    try:
+        check("devanagari -> english", transliterate("कृष्ण", "devanagari", "english"), "kṛṣṇa")
+        check("english -> devanagari", transliterate("bhārata", "english", "devanagari"), "भारत")
+        check("english digits", transliterate("१२३ भारत", "devanagari", "english"), "123 bhārata")
+    except RuntimeError as exc:
+        failures.append("English IAST dependency\n    %s" % exc)
+
     # Detection.
     check("detect tamil", detect_script("தமிழ் நாடு"), "tamil")
     check("detect devanagari", detect_script("Hello नमस्ते"), "devanagari")
@@ -503,10 +551,8 @@ def selftest():
 # Graphical interface
 # --------------------------------------------------------------------------
 
-PREVIEW_LIMIT = 40000       # characters shown in the text panes
-
-
 def run_gui():
+    import threading
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox, font as tkfont
 
@@ -540,7 +586,7 @@ def run_gui():
     digits_var = tk.BooleanVar(value=True)
     status = tk.StringVar(value="Choose a .txt file, pick the target script, then press Transliterate.")
 
-    state = {"full_text": "", "truncated": False}
+    state = {}
 
     outer = ttk.Frame(root, padding=12)
     outer.pack(fill="both", expand=True)
@@ -600,7 +646,8 @@ def run_gui():
     # --- buttons + status ----------------------------------------------
     buttons = ttk.Frame(outer)
     buttons.grid(row=6, column=0, columnspan=4, sticky="ew")
-    ttk.Button(buttons, text="Transliterate", command=lambda: do_convert()).pack(side="left")
+    convert_btn = ttk.Button(buttons, text="Transliterate", command=lambda: do_convert())
+    convert_btn.pack(side="left")
     ttk.Button(buttons, text="Save result as...", command=lambda: save_as()).pack(side="left", padx=6)
     ttk.Button(buttons, text="Clear", command=lambda: clear_all()).pack(side="left")
     ttk.Button(buttons, text="Quit", command=root.destroy).pack(side="right")
@@ -626,17 +673,14 @@ def run_gui():
         except OSError as exc:
             messagebox.showerror(APP_NAME, "Could not read the file:\n%s" % exc)
             return
-        state["full_text"] = text
-        state["truncated"] = len(text) > PREVIEW_LIMIT
         src_text.delete("1.0", "end")
-        src_text.insert("1.0", text[:PREVIEW_LIMIT])
+        src_text.insert("1.0", text)
         out_text.delete("1.0", "end")
         detected = detect_script(text)
         if detected:
             src_choice.set(choices[SCRIPT_ORDER.index(detected)])
-        note = " (showing the first %d characters)" % PREVIEW_LIMIT if state["truncated"] else ""
-        set_status("Loaded %s - %d characters, %s%s. Detected script: %s."
-                   % (os.path.basename(path), len(text), enc, note,
+        set_status("Loaded %s - %d characters, %s. Detected script: %s."
+                   % (os.path.basename(path), len(text), enc,
                       SCRIPTS[detected]["name"] if detected else "none found"))
 
     def pick_input():
@@ -665,8 +709,6 @@ def run_gui():
             out_path.set(suggest_output_path(source, target))
 
     def current_source_text():
-        if state["truncated"]:
-            return state["full_text"]
         return src_text.get("1.0", "end-1c")
 
     def do_convert():
@@ -682,25 +724,37 @@ def run_gui():
                            "'From' box.", False)
                 return
         target = key_from_choice(tgt_choice.get())
-        try:
-            result = transliterate(text, source, target, digits_var.get())
-        except Exception as exc:                          # pragma: no cover
-            messagebox.showerror(APP_NAME, "Conversion failed:\n%s" % exc)
-            return
-        out_text.delete("1.0", "end")
-        out_text.insert("1.0", result[:PREVIEW_LIMIT])
-        state["result"] = result
+        destination = out_path.get().strip()
+        convert_digits = digits_var.get()
+        convert_btn.configure(state="disabled")
+        set_status("Converting %d characters..." % len(text))
 
+        def worker():
+            try:
+                result = transliterate(text, source, target, convert_digits)
+                if destination:
+                    write_text_file(destination, result)
+            except Exception as exc:
+                root.after(0, lambda error=exc: finish_error(error))
+                return
+            root.after(0, lambda: finish_convert(result, source, target, destination))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_error(exc):
+        convert_btn.configure(state="normal")
+        set_status("Conversion failed: %s" % exc, False)
+        messagebox.showerror(APP_NAME, "Conversion failed:\n%s" % exc)
+
+    def finish_convert(result, source, target, destination):
+        convert_btn.configure(state="normal")
+        out_text.delete("1.0", "end")
+        out_text.insert("1.0", result)
+        state["result"] = result
         message = "Converted %s -> %s (%d characters)." % (
             SCRIPTS[source]["name"], SCRIPTS[target]["name"], len(result))
-        destination = out_path.get().strip()
         if destination:
-            try:
-                write_text_file(destination, result)
-                message += "  Saved to %s" % destination
-            except OSError as exc:
-                set_status(message + "  Could not save: %s" % exc, False)
-                return
+            message += "  Saved to %s" % destination
         else:
             message += "  Use 'Save result as...' to write it to a file."
         set_status(message)
@@ -729,8 +783,6 @@ def run_gui():
         set_status("Saved %d characters to %s" % (len(result), path))
 
     def clear_all():
-        state["full_text"] = ""
-        state["truncated"] = False
         state.pop("result", None)
         src_text.delete("1.0", "end")
         out_text.delete("1.0", "end")
@@ -738,10 +790,6 @@ def run_gui():
         out_path.set("")
         set_status("Cleared.")
 
-    def on_source_edit(_event=None):
-        state["truncated"] = False
-
-    src_text.bind("<KeyRelease>", on_source_edit)
     tgt_box.bind("<<ComboboxSelected>>", refresh_output_name)
     root.bind("<Control-Return>", lambda _e: do_convert())
 

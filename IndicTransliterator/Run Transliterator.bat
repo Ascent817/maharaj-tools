@@ -16,6 +16,21 @@ where py.exe       >nul 2>&1 && set "PYC=py -3"
 if not defined PYC where python.exe  >nul 2>&1 && set "PYC=python"
 
 if not defined PYW if not defined PYC goto :nopython
+if not defined PYC set "PYC=%PYW%"
+
+rem English (IAST) conversion uses the maintained indic-transliteration package.
+%PYC% -c "import indic_transliteration" >nul 2>&1
+if errorlevel 1 (
+    echo Installing English transliteration support...
+    %PYC% -m pip install indic-transliteration==2.3.82
+    if errorlevel 1 (
+        echo.
+        echo   Could not install indic-transliteration.
+        echo   Check your internet connection, then run this file again.
+        pause
+        exit /b 1
+    )
+)
 
 if defined PYW (
     start "" %PYW% "%SCRIPT%"

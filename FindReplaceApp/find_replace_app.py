@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Find & Replace  -  batch text replacement driven by a CSV dictionary.
+Find & Replace - batch replacement driven by a CSV dictionary.
 
-    Input      : a plain-text .txt file
+    Input      : a plain-text .txt file or first worksheet of a legacy .xls file
     Reference  : a .csv file, column A = word to find, column B = replacement
-    Output     : a new .txt file with every replacement applied
+    Output     : a matching .txt or values-only .xls file
 
 Double-click "Find and Replace.bat" to launch the GUI.
 
@@ -13,7 +13,7 @@ Command line (headless) use:
     python find_replace_app.py input.txt replacements.csv output.txt
                                [--whole-word] [--ignore-case]
 
-Standard library only - no pip installs required.
+Excel support uses xlrd and xlwt; the standalone executable bundles them.
 """
 
 import codecs
@@ -25,7 +25,7 @@ import threading
 import traceback
 
 APP_NAME = "Find & Replace"
-VERSION = "1.0"
+VERSION = "1.1"
 
 # Encodings tried, in order, when a file carries no byte-order mark.
 ENCODINGS = ("utf-8", "cp1252", "latin-1")
@@ -197,6 +197,13 @@ def run_job(input_path, csv_path, output_path,
             "Column A must hold the word to find and column B the replacement."
         )
 
+    if os.path.splitext(input_path)[1].lower() == ".xls":
+        return run_xls_job(input_path, output_path, pairs, warnings,
+                           whole_word, ignore_case)
+
+    if os.path.splitext(output_path)[1].lower() == ".xls":
+        raise ValueError("A text input must be saved as a text output, not .xls.")
+
     text, encoding = read_text(input_path)
     new_text, counts = replace_text(text, pairs, whole_word, ignore_case)
 
@@ -215,12 +222,112 @@ def run_job(input_path, csv_path, output_path,
         "output": output_path,
         "chars_in": len(text),
         "chars_out": len(new_text),
+        "kind": "text",
     }
+
+
+def _excel_modules():
+    try:
+        import xlrd
+        import xlwt
+    except ImportError as exc:
+        raise ValueError(
+            "Excel .xls support is not installed. Run:\n"
+            "    python -m pip install xlrd==2.0.2 xlwt==1.3.0"
+        ) from exc
+    return xlrd, xlwt
+
+
+def run_xls_job(input_path, output_path, pairs, warnings,
+                whole_word=False, ignore_case=False):
+    """Replace text in the first worksheet and write a values-only .xls file."""
+    if os.path.splitext(output_path)[1].lower() != ".xls":
+        raise ValueError("An .xls input must be saved as an .xls output file.")
+
+    xlrd, xlwt = _excel_modules()
+    try:
+        book = xlrd.open_workbook(input_path)
+    except Exception as exc:
+        raise ValueError(
+            "Could not read the .xls workbook. It may be damaged or password-protected: %s"
+            % exc
+        ) from exc
+    if not book.nsheets:
+        raise ValueError("The .xls workbook has no worksheets.")
+
+    sheet = book.sheet_by_index(0)
+    if sheet.nrows > 65536 or sheet.ncols > 256:
+        raise ValueError("The first worksheet exceeds the .xls limit of 65,536 rows by 256 columns.")
+
+    counts = {find: 0 for find, _ in pairs}
+    chars_in = chars_out = 0
+    output_book = xlwt.Workbook()
+    output_sheet = output_book.add_sheet(sheet.name)
+    date_style = xlwt.easyxf(num_format_str="YYYY-MM-DD HH:MM:SS")
+
+    for row in range(sheet.nrows):
+        for col in range(sheet.ncols):
+            cell = sheet.cell(row, col)
+            value = cell.value
+            style = None
+            if cell.ctype == xlrd.XL_CELL_TEXT:
+                chars_in += len(value)
+                value, cell_counts = replace_text(value, pairs, whole_word, ignore_case)
+                chars_out += len(value)
+                for find, amount in cell_counts.items():
+                    counts[find] += amount
+                if len(value) > 32767:
+                    raise ValueError(
+                        "Replacement makes cell %s%d longer than the .xls limit of 32,767 characters."
+                        % (_excel_column(col), row + 1)
+                    )
+            elif cell.ctype == xlrd.XL_CELL_DATE:
+                value = xlrd.xldate_as_datetime(value, book.datemode)
+                style = date_style
+            elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
+                value = bool(value)
+            elif cell.ctype == xlrd.XL_CELL_ERROR:
+                value = xlrd.error_text_from_code.get(value, "#ERROR")
+            elif cell.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+                continue
+            output_sheet.write(row, col, value, style) if style else output_sheet.write(row, col, value)
+
+    try:
+        output_book.save(output_path)
+    except Exception as exc:
+        raise ValueError("Could not write the .xls output: %s" % exc) from exc
+
+    return {
+        "pairs": pairs,
+        "counts": counts,
+        "warnings": warnings,
+        "total": sum(counts.values()),
+        "applied": sum(1 for value in counts.values() if value),
+        "encoding": "Excel 97-2003 values",
+        "output": output_path,
+        "chars_in": chars_in,
+        "chars_out": chars_out,
+        "kind": "xls",
+        "sheet": sheet.name,
+        "rows": sheet.nrows,
+        "cols": sheet.ncols,
+    }
+
+
+def _excel_column(index):
+    """Zero-based column number as an Excel A1-style column label."""
+    label = ""
+    index += 1
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        label = chr(65 + remainder) + label
+    return label
 
 
 def default_output_path(input_path):
     base, ext = os.path.splitext(input_path)
-    return base + "_replaced" + (ext or ".txt")
+    ext = ext.lower()
+    return base + "_replaced" + (".xls" if ext == ".xls" else (ext or ".txt"))
 
 
 def _clip(value, width):
@@ -239,6 +346,9 @@ def format_report(result, input_path, csv_path):
     add("Reference file  : %s" % csv_path)
     add("Output file     : %s" % result["output"])
     add("File encoding   : %s" % result["encoding"])
+    if result.get("kind") == "xls":
+        add("Worksheet       : %s (%d rows x %d columns)"
+            % (result["sheet"], result["rows"], result["cols"]))
     add("")
     add("Replacement pairs loaded : %d" % len(result["pairs"]))
     add("Pairs that matched       : %d" % result["applied"])
@@ -305,7 +415,7 @@ def launch_gui():
               font=("Segoe UI", 15, "bold")).pack(anchor="w")
     ttk.Label(
         outer,
-        text="Replace words in a text file using a CSV list "
+        text="Replace words in a text or .xls file using a CSV list "
              "(column A = find, column B = replace with).",
         foreground="#555555",
     ).pack(anchor="w", pady=(0, 12))
@@ -327,8 +437,10 @@ def launch_gui():
 
     def pick_input():
         path = filedialog.askopenfilename(
-            title="Select the input text file",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            title="Select the input file",
+            filetypes=[("Supported inputs", "*.txt *.xls"),
+                       ("Text files", "*.txt"), ("Excel 97-2003", "*.xls"),
+                       ("All files", "*.*")],
         )
         if path:
             path = os.path.normpath(path)
@@ -351,21 +463,23 @@ def launch_gui():
         if not initial:
             src = input_var.get().strip()
             initial = default_output_path(src) if src else "output.txt"
+        is_xls = os.path.splitext(input_var.get().strip())[1].lower() == ".xls"
         path = filedialog.asksaveasfilename(
             title="Save the output file as",
-            defaultextension=".txt",
+            defaultextension=".xls" if is_xls else ".txt",
             initialfile=os.path.basename(initial),
             initialdir=os.path.dirname(initial) or None,
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            filetypes=([("Excel 97-2003", "*.xls"), ("All files", "*.*")]
+                       if is_xls else [("Text files", "*.txt"), ("All files", "*.*")]),
         )
         if path:
             output_var.set(os.path.normpath(path))
 
-    add_row(0, "1.  Input file (.txt)", input_var, pick_input,
-            "The text file you want to change.")
+    add_row(0, "1.  Input file (.txt or .xls)", input_var, pick_input,
+            "For .xls, the first worksheet is processed as values-only data.")
     add_row(2, "2.  Reference file (.csv)", csv_var, pick_csv,
             "Column A = word to find, column B = word to replace with.")
-    add_row(4, "3.  Output file (.txt)", output_var, pick_output,
+    add_row(4, "3.  Output file (.txt or .xls)", output_var, pick_output,
             "Created for you; the input file is never modified.")
 
     # ---- options ---------------------------------------------------------
@@ -469,7 +583,11 @@ def launch_gui():
         ref = csv_var.get().strip()
         out = output_var.get().strip()
         if not inp or not os.path.isfile(inp):
-            messagebox.showerror(APP_NAME, "Please select a valid input .txt file.")
+            messagebox.showerror(APP_NAME, "Please select a valid input .txt or .xls file.")
+            return None
+        input_ext = os.path.splitext(inp)[1].lower()
+        if input_ext not in (".txt", ".xls"):
+            messagebox.showerror(APP_NAME, "The input must be a .txt or .xls file.")
             return None
         if not ref or not os.path.isfile(ref):
             messagebox.showerror(APP_NAME,
@@ -478,6 +596,12 @@ def launch_gui():
         if not out:
             out = default_output_path(inp)
             output_var.set(out)
+        required_ext = ".xls" if input_ext == ".xls" else ".txt"
+        if os.path.splitext(out)[1].lower() != required_ext:
+            messagebox.showerror(
+                APP_NAME, "A %s input must be saved as a %s output."
+                % (input_ext, required_ext))
+            return None
         if os.path.abspath(out) in (os.path.abspath(inp), os.path.abspath(ref)):
             messagebox.showerror(
                 APP_NAME,

@@ -136,14 +136,6 @@ def extract_video_id(url_or_id: str) -> str:
     return candidate
 
 
-# YouTube's playlist page ships its first pageful of items only; the
-# continuation endpoint that would fetch the rest no longer returns them,
-# so this is the honest ceiling for one request.
-PLAYLIST_PAGE_ITEMS = 100
-VIDEO_ID_IN_PAGE = re.compile(r'"videoId":"([A-Za-z0-9_-]{11})"')
-PAGE_TITLE = re.compile(r"<title>(.*?)</title>", re.S)
-
-
 def extract_playlist_id(url_or_id: str) -> str | None:
     """The list= id from a link, or None when the link is not part of a playlist."""
     text = (url_or_id or "").strip().strip('"').strip("'")
@@ -160,6 +152,21 @@ def extract_playlist_id(url_or_id: str) -> str | None:
     return values[0] if values and values[0] else None
 
 
+def extract_playlist_index(url_or_id: str) -> int | None:
+    """Return a link's one-based playlist index, when it contains a valid one."""
+    text = (url_or_id or "").strip().strip('"').strip("'")
+    if not text or "index=" not in text:
+        return None
+    if "//" not in text:
+        text = "https://" + text
+    values = urllib.parse.parse_qs(urllib.parse.urlparse(text).query).get("index")
+    try:
+        index = int(values[0]) if values else 0
+    except (TypeError, ValueError):
+        return None
+    return index if index > 0 else None
+
+
 def _get_page(url: str, timeout: int = 25) -> str:
     _pace()
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -171,9 +178,8 @@ def fetch_playlist(playlist_id: str, limit: int | None = None) -> dict:
     """
     The videos in a playlist, in playlist order.
 
-    Returns {'id', 'title', 'video_ids', 'found', 'capped'} where 'found' is how
-    many the page listed and 'capped' says the page limit was hit, so the caller
-    can tell the user that more videos may exist beyond what was read.
+    yt-dlp is used in flat mode so the complete ordered playlist can be read
+    without downloading media. The returned entries also carry title hints.
     """
     if playlist_id.startswith("RD"):
         raise TranscriptError(
@@ -185,31 +191,51 @@ def fetch_playlist(playlist_id: str, limit: int | None = None) -> dict:
             "contents cannot be read without signing in.")
 
     try:
-        page = _get_page("https://www.youtube.com/playlist?list="
-                         + urllib.parse.quote(playlist_id, safe=""))
+        from yt_dlp import YoutubeDL
+    except ImportError as exc:
+        raise TranscriptError(
+            "Playlist support needs yt-dlp. Install it with:\n"
+            "    python -m pip install yt-dlp==2026.8.19"
+        ) from exc
+
+    url = "https://www.youtube.com/playlist?list=" + urllib.parse.quote(playlist_id, safe="")
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+        "ignoreerrors": True,
+    }
+    try:
+        with YoutubeDL(options) as downloader:
+            data = downloader.extract_info(url, download=False)
     except Exception as exc:
         raise TranscriptError(f"Could not open that playlist ({type(exc).__name__}).") from exc
 
-    video_ids = list(dict.fromkeys(VIDEO_ID_IN_PAGE.findall(page)))
-    if not video_ids:
+    entries = []
+    for entry in (data or {}).get("entries") or []:
+        if not entry:
+            continue
+        video_id = entry.get("id")
+        if not video_id or not ID_RE.match(video_id):
+            continue
+        entries.append({"id": video_id, "title": entry.get("title") or video_id})
+    if not entries:
         raise TranscriptError(
             "No videos could be read from that playlist. It may be private, "
             "empty, or deleted.")
 
-    match = PAGE_TITLE.search(page)
-    title = ""
-    if match:
-        title = html.unescape(re.sub(r"\s*-\s*YouTube\s*$", "", match.group(1))).strip()
-
-    found = len(video_ids)
+    found = len(entries)
     if limit is not None and limit > 0:
-        video_ids = video_ids[:limit]
+        entries = entries[:limit]
+    video_ids = [entry["id"] for entry in entries]
     return {
         "id": playlist_id,
-        "title": title or playlist_id,
+        "title": (data or {}).get("title") or playlist_id,
         "video_ids": video_ids,
+        "entries": entries,
         "found": found,
-        "capped": found >= PLAYLIST_PAGE_ITEMS,
+        "capped": False,
     }
 
 
@@ -251,7 +277,8 @@ def playlist_for_video(video_id: str) -> dict | None:
     return fallback
 
 
-def take_from(info: dict, start_video_id: str | None, limit: int) -> tuple[list[str], int]:
+def take_from(info: dict, start_video_id: str | None, limit: int,
+              start_index: int | None = None) -> tuple[list[str], int]:
     """
     `limit` ids from a playlist, beginning at the given video when it is there.
 
@@ -259,7 +286,12 @@ def take_from(info: dict, start_video_id: str | None, limit: int) -> tuple[list[
     next few"; a playlist link with no video in it starts at the beginning.
     """
     ids = info["video_ids"]
-    start = ids.index(start_video_id) if start_video_id in ids else 0
+    if start_video_id in ids:
+        start = ids.index(start_video_id)
+    elif start_index is not None and 1 <= start_index <= len(ids):
+        start = start_index - 1
+    else:
+        start = 0
     return ids[start:start + max(1, limit)], start
 
 

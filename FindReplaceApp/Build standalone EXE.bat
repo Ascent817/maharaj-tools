@@ -7,8 +7,8 @@ rem ===================================================================
 setlocal
 cd /d "%~dp0"
 
-echo Installing / updating PyInstaller...
-python -m pip install --upgrade pyinstaller
+echo Installing / updating build dependencies...
+python -m pip install --upgrade pyinstaller xlrd==2.0.2 xlwt==1.3.0
 if errorlevel 1 (
     echo.
     echo   Could not install PyInstaller. Check your internet connection.
@@ -18,8 +18,7 @@ if errorlevel 1 (
 
 echo.
 echo Building FindAndReplace.exe ...
-python -m PyInstaller --noconfirm --onefile --windowed ^
-    --name FindAndReplace find_replace_app.py
+python -m PyInstaller --noconfirm --clean FindAndReplace.spec
 if errorlevel 1 (
     echo.
     echo   Build failed - see the messages above.
